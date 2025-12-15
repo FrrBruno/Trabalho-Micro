@@ -1,0 +1,323 @@
+
+// Inclusões de bibliotecas padrão do AVR e C
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdlib.h> // Para atoi
+#include <string.h> // Para memset
+#include <stdio.h>  // Para snprintf
+
+// --- DEFINIÇÕES DE HARDWARE E CONFIGURAÇÃO ---
+#define PERIODO_MEDICAO_MS 1000 // Intervalo de medição de RPM (1 segundo)
+#define TAMANHO_FILTRO_RPM 4   // Número de amostras para o filtro de média móvel
+#define PULSOS_POR_VOLTA 1     // Número de pulsos do sensor por rotação completa do eixo
+
+// Definições de Portas/Pinos:
+// Motor PWM: PB1 (OC1A/Arduino D9)
+// Sensor de Rotação: PD3 (INT1/Arduino D3)
+// Serial: TX (PD1), RX (PD0)
+
+// --- Variáveis Globais Voláteis (Controladas por Interrupção) ---
+volatile uint32_t contador_pulsos_total = 0;   // Contador global de pulsos do sensor
+volatile uint8_t flag_medicao_pronta = 0;     // Flag setada a cada PERIODO_MEDICAO_MS
+volatile uint16_t pulsos_ultimo_periodo = 0; // Pulsos contados no último intervalo de 1s
+
+// Variável para a interrupção do Timer 2 (período de 1ms)
+volatile uint16_t contador_timer_ms = 0;
+
+// --- FUNÇÕES DE UTILIDADE SERIAL ---
+
+void uart_configurar(void) {
+    // Cálculo : (16000000 / (16 * 9600)) - 1 = 103 (para 9600bps @ 16MHz)
+    //Registradores de alto e baixo
+    UBRR0H = 0; //alto
+    UBRR0L = 103; //baixo
+
+    // Habilita Transmissor (TX) e Receptor (RX)
+    UCSR0B = (1 << TXEN0) | (1 << RXEN0);
+
+    // Formato: 8 bits de dados, 1 stop bit
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+}
+
+void uart_enviar_string(const char *texto) {
+    while (*texto) {
+        // Aguarda até que o buffer de transmissão esteja vazio (UDRE0 = 1)
+        while (!(UCSR0A & (1 << UDRE0)));
+        UDR0 = *texto++; // Envia o caractere e avança o ponteiro
+        //Percorre a mensagem letra por letra, quando o hardware de envio fique livre ele envia a letra e passa para proxima.
+    }
+}
+
+void uart_enviar_numero(uint16_t numero) {
+    char buffer[10];
+    // Formata o número (uint) em uma string tornando visivel para o computador
+    snprintf(buffer, sizeof(buffer), "%u", numero);
+    uart_enviar_string(buffer);
+}
+
+//Verifica se há dados disponíveis para leitura na UART.
+//Garante que o processador só chame a função de leitura bloqueante (recebeDados()) quando ele tiver certeza de que há dados
+uint8_t uart_dado_disponivel(void) {
+    return (UCSR0A & (1 << RXC0));
+}
+
+//Lê um caractere recebido pela UART (bloqueante).
+// return O caractere recebido.
+ 
+char uart_receber_char(void) {
+    // Espera por dado (RXC0 = 1)
+    while (!uart_dado_disponivel());
+    return UDR0;
+}
+
+// --- FUNÇÕES DE CONTROLE DO MOTOR (PWM) ---
+
+//Configura o Timer/Contador 1 para gerar sinal PWM no pino OC1A (PB1/D9).
+ 
+void motor_configurar(void) {
+    // Configura PB1 (OC1A) como saída
+    DDRB |= (1 << PB1);
+
+    // Modo PWM Rápido de 8-bit (WGM12=1, WGM10=1, WGM11=0, WGM13=0)
+    // O valor TOP é 0x00FF (255)
+    TCCR1A = (1 << WGM10) | (1 << COM1A1); // Fast PWM, Saída não-invertida (Clear OC1A on Compare Match)
+    TCCR1B = (1 << WGM12) | (1 << CS11);  // WGM12 para Fast PWM 8-bit, Prescaler 8
+    // Frequência do PWM = 16MHz / (8 * (255 + 1)) = 7812.5 Hz (aprox. 7.8kHz)
+
+    // Duty Cycle inicial de 0% (motor parado)
+    OCR1A = 0;
+}
+
+//Define a velocidade desejada de 0 a 100% do motor usando PWM.
+
+void motor_definir_velocidade(uint8_t velocidade_percentual) {
+    // Proteção contra valores acima de 100%
+    if (velocidade_percentual > 100) {
+        velocidade_percentual = 100;
+    }
+    // Converte a porcentagem (0-100) para o valor de registro PWM (0-255)
+    // OCR1A = (vel * 255) / 100;
+    OCR1A = (uint8_t)(((uint16_t)velocidade_percentual * 255UL) / 100UL);
+}
+
+// --- FUNÇÕES DE MEDIÇÃO DE RPM (SENSOR DE ROTAÇÃO) ---
+
+
+ //Interrupção Externa 1 (INT1) - Sensor de Rotação (PD3/D3).
+ 
+ISR(INT1_vect) {
+    // Incrementa o contador a cada pulso (borda de descida) do sensor
+    contador_pulsos_total++;
+}
+
+
+//Configura o pino PD3 (INT1) para ser a entrada do sensor de rotação.
+ 
+void sensor_configurar_rotacao(void) {
+    // PD3 como entrada
+    DDRD &= ~(1 << PD3);
+    // Ativa pull-up interno em PD3
+    PORTD |= (1 << PD3);
+
+    // Configura INT1: Interrupção na borda de descida (Falling Edge)
+    EICRA |= (1 << ISC11);
+    EICRA &= ~(1 << ISC10);
+
+    // Habilita a Interrupção Externa 1
+    EIMSK |= (1 << INT1);
+}
+
+
+ //Função de filtro de média móvel para estabilizar a leitura de RPM.
+ //nova_medida O valor de RPM recém-calculado.
+ // O valor de RPM filtrado.
+ 
+uint16_t filtrar_rpm_media_movel(uint16_t nova_medida) {
+    static uint16_t historico_rpm[TAMANHO_FILTRO_RPM] = {0};
+    static uint8_t indice = 0;
+    static uint8_t buffer_cheio = 0;
+
+    // Armazena a nova medida no histórico
+    historico_rpm[indice] = nova_medida;
+    indice = (indice + 1) % TAMANHO_FILTRO_RPM;
+
+    // Verifica se o buffer já foi preenchido pelo menos uma vez
+    if (!buffer_cheio && indice == 0) {
+        buffer_cheio = 1;
+    }
+
+    uint32_t soma = 0;
+    uint8_t elementos_validos;
+
+    // Determina quantos elementos usar na média
+    if (buffer_cheio) {
+        elementos_validos = TAMANHO_FILTRO_RPM;
+    } else {
+        elementos_validos = indice;
+    }
+
+    // Soma os elementos válidos
+    for (uint8_t i = 0; i < elementos_validos; i++) {
+        soma += historico_rpm[i];
+    }
+
+    // Evita divisão por zero
+    if (elementos_validos == 0) return 0;
+
+    // Retorna a média
+    return (uint16_t)(soma / elementos_validos);
+}
+
+// --- FUNÇÕES DE TEMPORIZADOR (TIMER) ---
+
+/**
+ * @brief Configura o Timer/Contador 2 para gerar interrupções a cada 1ms.
+ */
+void timer_configurar_medicao(void) {
+    // Modo CTC (Clear Timer on Compare Match)
+    TCCR2A = (1 << WGM21);
+
+    // Prescaler de 64
+    TCCR2B = (1 << CS22);
+
+    // Valor de comparação para 1ms: 16MHz / 64 / 1000Hz - 1 = 249
+    OCR2A = 249;
+
+    // Habilita a interrupção de Comparação A do Timer 2
+    TIMSK2 |= (1 << OCIE2A);
+}
+
+
+//Interrupção de Comparação A do Timer 2 (acontece a cada 1ms).
+ 
+ISR(TIMER2_COMPA_vect) {
+    contador_timer_ms++;
+
+    // Verifica se atingiu o período de medição (ex: 1000ms = 1s)
+    if (contador_timer_ms >= PERIODO_MEDICAO_MS) {
+        contador_timer_ms = 0;
+
+        // Salva a contagem de pulsos e reseta o contador total
+        pulsos_ultimo_periodo = contador_pulsos_total;
+        contador_pulsos_total = 0;
+
+        // Sinaliza que uma nova medição de RPM está pronta
+        flag_medicao_pronta = 1;
+    }
+}
+
+
+// --- PROGRAMA PRINCIPAL ---
+
+int main(void) {
+    // 1. Configuração dos Periféricos
+    motor_configurar();
+    sensor_configurar_rotacao();
+    timer_configurar_medicao();
+    uart_configurar();
+
+    // Habilita interrupções globais (Interrupt Enable)
+    sei();
+
+    // 2. Variáveis de Estado
+    uint8_t velocidade_pwm_atual = 0;   // Velocidade PWM aplicada (0-100%)
+    uint8_t velocidade_pwm_desejada = 0;// Velocidade solicitada pelo usuário (0-100%)
+    uint16_t rpm_medido = 0;            // RPM atual calculado e filtrado
+    uint16_t rampa_timer_ms = 0;        // Contador para o controle da rampa de velocidade (aceleração suave)
+
+    // 3. Buffer de Comando Serial
+    char buffer_comando[10] = {0};      // Armazena o comando digitado
+    uint8_t indice_buffer = 0;          // Índice de preenchimento do buffer
+
+    // 4. Mensagem Inicial
+    uart_enviar_string("Sistema de Controle de Motor DC\r\n");
+    uart_enviar_string("Comandos: 0-100 (vel%) ou 's' para STOP\r\n");
+    uart_enviar_string("====================================\r\n");
+
+    // 5. Loop Principal
+    while (1) {
+        // --- 5.1. PROCESSAMENTO DE COMANDOS SERIAL ---
+        if (uart_dado_disponivel()) {
+            char entrada = uart_receber_char();
+
+            // Acumula dígitos (0-9)
+            if (entrada >= '0' && entrada <= '9' && indice_buffer < 9) {
+                buffer_comando[indice_buffer++] = entrada;
+            }
+            // Comando 's' ou 'S' (STOP/Parar)
+            else if ((entrada == 'S' || entrada == 's') && indice_buffer == 0) {
+                velocidade_pwm_desejada = 0;
+                uart_enviar_string("Motor PARADO (Vel desejada: 0%)\r\n");
+            }
+            // Processa comando numérico (ao receber ENTER/CR)
+            else if ((entrada == '\r' || entrada == '\n') && indice_buffer > 0) {
+                buffer_comando[indice_buffer] = '\0'; // Finaliza a string
+                uint16_t valor = atoi(buffer_comando);
+
+                // Valida o valor (0 a 100)
+                if (valor <= 100) {
+                    velocidade_pwm_desejada = (uint8_t)valor;
+                    uart_enviar_string("Velocidade ajustada para ");
+                    uart_enviar_numero(valor);
+                    uart_enviar_string("%\r\n");
+                } else {
+                    uart_enviar_string("ERRO: Velocidade deve ser 0-100%\r\n");
+                }
+
+                // Limpa o buffer
+                indice_buffer = 0;
+                memset(buffer_comando, 0, sizeof(buffer_comando));
+            }
+            // Comando inválido ou caractere não esperado
+            else if (entrada != '\r' && entrada != '\n') {
+                uart_enviar_string("ERRO: Comando invalido. Digite vel (0-100) ou 's'.\r\n");
+                indice_buffer = 0;
+                memset(buffer_comando, 0, sizeof(buffer_comando));
+            }
+        }
+
+        // --- 5.2. CÁLCULO E FILTRAGEM DO RPM ---
+        if (flag_medicao_pronta) { // Flag setada pela ISR do Timer 2 a cada 1s
+            flag_medicao_pronta = 0;
+
+            // 1. Cálculo do RPM: Pulsos/s * 60s/min / Pulsos/volta
+            rpm_medido = (pulsos_ultimo_periodo * 60UL) / PULSOS_POR_VOLTA;
+
+            // 2. Aplica filtro de média móvel
+            rpm_medido = filtrar_rpm_media_movel(rpm_medido);
+
+            // 3. Exibição de informações (a cada 1s)
+            uart_enviar_string("PWM: ");
+            uart_enviar_numero(velocidade_pwm_atual);
+            uart_enviar_string("% | RPM: ");
+            uart_enviar_numero(rpm_medido);
+            uart_enviar_string(" r/seg\r\n");
+        }
+
+        // --- 5.3. CONTROLE SUAVE DE VELOCIDADE (RAMPA) ---
+        // Implementa um controle de aceleração suave a cada 50ms
+
+        if (rampa_timer_ms >= 50) { // A cada 50ms
+            rampa_timer_ms = 0;
+
+            // Controle de aceleração/desaceleração (aumenta ou diminui 1% a cada 50ms)
+            if (velocidade_pwm_atual < velocidade_pwm_desejada) {
+                velocidade_pwm_atual++;
+            } else if (velocidade_pwm_atual > velocidade_pwm_desejada) {
+                velocidade_pwm_atual--;
+            }
+
+            // Aplica a nova velocidade de rampa ao motor
+            motor_definir_velocidade(velocidade_pwm_atual);
+        }
+
+        // --- 5.4. Delay e Atualização do Timer da Rampa ---
+        // O loop espera 10ms, e este tempo é somado ao timer da rampa.
+        _delay_ms(10);
+        rampa_timer_ms += 10;
+    }
+
+    // Código inalcançável (apenas para conformidade)
+    return 0;
+}
