@@ -1,4 +1,4 @@
-#define F_CPU 16000000UL // Clock do Arduino Un
+#define F_CPU 16000000UL // Clock do Arduino Uno
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/delay.h>
