@@ -166,7 +166,7 @@ int main(void) {
             UART_send_string(linha);
             UART_send_string("-------------------------------------\r\n");
         }
-        
+        .
         _delay_ms(10); 
     }
 }
