@@ -1,4 +1,4 @@
-#define F_CPU 16000000UL // Clock do Arduino Uno
+#define F_CPU 16000000UL // Clock do Arduino Un
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/delay.h>
@@ -166,7 +166,7 @@ int main(void) {
             UART_send_string(linha);
             UART_send_string("-------------------------------------\r\n");
         }
-        .
+      
         _delay_ms(10); 
     }
 }
